@@ -1,10 +1,10 @@
 import requests
 
 # Replace with your Meraki API key
-MERAKI_API_KEY = ‘Your API Key goes here’
+MERAKI_API_KEY = 'Your API key goes here'
 
 # Replace with your Organization ID
-ORGANIZATION_ID = ‘Your Org ID goes here’
+ORGANIZATION_ID = 'Your Org ID goes here'
 
 # Meraki base URL
 MERAKI_BASE_URL = 'https://api.meraki.com/api/v1'
@@ -20,9 +20,16 @@ def read_vlan_configurations(file_path):
     with open(file_path, 'r') as file:
         for line in file:
             parts = line.strip().split(',')
-            if len(parts) == 2:
-                object_group, vlan_id = parts
-                vlan_configs[vlan_id.strip()] = object_group.strip()
+            if len(parts) >= 2:
+                object_group = parts[0].strip()
+                vlan_ids = [vlan_id.strip() for vlan_id in parts[1:]]
+                for vlan_id in vlan_ids:
+                    if vlan_id in vlan_configs:
+                        print(f"Warning: VLAN ID {vlan_id} is listed under multiple groups. Only the last association will be retained.")
+                    if object_group in vlan_configs:
+                        vlan_configs[object_group].append(vlan_id)
+                    else:
+                        vlan_configs[object_group] = [vlan_id]
     return vlan_configs
 
 def get_networks_with_appliance(organization_id):
@@ -95,26 +102,28 @@ def update_policy_object_group(organization_id, group_id, name, object_ids):
 
 def match_vlans_and_print(vlan_configs, networks, policy_objects):
     policy_object_ids = {}
-    for network in networks:
-        vlans = get_vlans_for_network(network['id'])
-        for vlan in vlans:
-            vlan_id = str(vlan['id'])
-            if vlan_id in vlan_configs:
-                print(f"Match found - Network ID: {network['id']}, Name: {network['name']}, VLAN ID: {vlan_id}, Subnet: {vlan['subnet']}")
-                policy_object = next((po for po in policy_objects if po['cidr'] == vlan['subnet']), None)
-                if policy_object:
-                    print(f"Policy object match found - ID: {policy_object['id']}, Name: {policy_object['name']}, CIDR: {policy_object['cidr']}")
-                    if vlan_configs[vlan_id] not in policy_object_ids:
-                        policy_object_ids[vlan_configs[vlan_id]] = [policy_object['id']]
+    for object_group, vlan_ids in vlan_configs.items():
+        for network in networks:
+            vlans = get_vlans_for_network(network['id'])
+            for vlan in vlans:
+                vlan_id = str(vlan['id'])
+                if vlan_id in vlan_ids:
+                    print(f"Match found - Network ID: {network['id']}, Name: {network['name']}, VLAN ID: {vlan_id}, Subnet: {vlan['subnet']}")
+                    policy_object = next((po for po in policy_objects if po['cidr'] == vlan['subnet']), None)
+                    if policy_object:
+                        print(f"Policy object match found - ID: {policy_object['id']}, Name: {policy_object['name']}, CIDR: {policy_object['cidr']}")
+                        if object_group not in policy_object_ids:
+                            policy_object_ids[object_group] = [policy_object['id']]
+                        else:
+                            policy_object_ids[object_group].append(policy_object['id'])
                     else:
-                        policy_object_ids[vlan_configs[vlan_id]].append(policy_object['id'])
-                else:
-                    print(f"Policy object not found, creating one - CIDR: {vlan['subnet']}")
-                    new_po = create_policy_object(ORGANIZATION_ID, vlan['subnet'].replace('/', '_'), vlan['subnet'])
-                    if vlan_configs[vlan_id] not in policy_object_ids:
-                        policy_object_ids[vlan_configs[vlan_id]] = [new_po['id']]
-                    else:
-                        policy_object_ids[vlan_configs[vlan_id]].append(new_po['id'])
+                        print(f"Policy object not found, creating one - CIDR: {vlan['subnet']}")
+                        new_po = create_policy_object(ORGANIZATION_ID, vlan['subnet'].replace('/', '_'), vlan['subnet'])
+                        if new_po:
+                            if object_group not in policy_object_ids:
+                                policy_object_ids[object_group] = [new_po['id']]
+                            else:
+                                policy_object_ids[object_group].append(new_po['id'])
     return policy_object_ids
 
 def main():
@@ -123,17 +132,14 @@ def main():
     policy_objects = get_policy_objects(ORGANIZATION_ID)
     policy_object_ids = match_vlans_and_print(vlan_configs, networks, policy_objects)
     policy_object_groups = get_policy_object_groups(ORGANIZATION_ID)
-    
+
     all_assigned_ids = [id for ids in policy_object_ids.values() for id in ids]
 
     for group_name, object_ids in policy_object_ids.items():
         group = next((g for g in policy_object_groups if g['name'] == group_name), None)
         if group:
             print(f"Policy object group found - ID: {group['id']}, Name: {group['name']}")
-            all_ids = group['objectIds']
-            for object_id in object_ids:
-                if object_id not in all_ids:
-                    all_ids.append(object_id)
+            all_ids = list(set(group['objectIds'] + object_ids))
             update_policy_object_group(ORGANIZATION_ID, group['id'], group['name'], all_ids)
         else:
             print(f"Policy object group not found, creating one - Name: {group_name}")
@@ -145,25 +151,19 @@ def main():
         vlans = get_vlans_for_network(network['id'])
         for vlan in vlans:
             subnet = vlan['subnet']
-            policy_object = next((po for po in policy_objects if po['cidr'] == subnet), None)
+            policy_object = next((po for po in policy_objects if po['cidr'] == subnet and po['id'] not in all_assigned_ids), None)
             if not policy_object:
                 print(f"Creating policy object for non-matched VLAN - Subnet: {subnet}")
                 new_po = create_policy_object(ORGANIZATION_ID, subnet.replace('/', '_').replace('.', '_'), subnet)
                 if new_po:
                     unassigned_object_ids.append(new_po['id'])
-            else:
-                if policy_object['id'] not in all_assigned_ids and policy_object['name'].replace('_', '').isdigit():
-                    unassigned_object_ids.append(policy_object['id'])
 
     # creating "unassigned" policy object group
     if unassigned_object_ids:
         unassigned_group = next((g for g in policy_object_groups if g['name'] == 'unassigned'), None)
         if unassigned_group:
             print(f"Policy object group 'unassigned' found - ID: {unassigned_group['id']}")
-            all_ids = unassigned_group['objectIds']
-            for object_id in unassigned_object_ids:
-                if object_id not in all_ids:
-                    all_ids.append(object_id)
+            all_ids = list(set(unassigned_group['objectIds'] + unassigned_object_ids))
             update_policy_object_group(ORGANIZATION_ID, unassigned_group['id'], 'unassigned', all_ids)
         else:
             print(f"Policy object group 'unassigned' not found, creating one")
